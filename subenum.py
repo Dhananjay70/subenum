@@ -1321,6 +1321,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="SubRecon – Comprehensive Subdomain Enumeration Automation",
+        usage=argparse.SUPPRESS,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
