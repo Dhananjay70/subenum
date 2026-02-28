@@ -419,7 +419,9 @@ class APIFetcher:
                         if not url_list:
                             break
                         for entry in url_list:
-                            hostname = entry.get("hostname", "")
+                            hostname = entry.get("hostname") or ""
+                            if not hostname:
+                                continue
                             cleaned = clean_subdomain(hostname)
                             if is_valid_subdomain(cleaned, self.domain):
                                 subs.add(cleaned)
