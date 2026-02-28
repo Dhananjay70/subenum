@@ -1299,12 +1299,10 @@ async def run(args):
         print_source_table(all_source_results, len(all_subdomains))
 
         console.print(Panel(
-            f"[bold]Unique Subdomains:[/bold] [cyan]{len(all_subdomains)}[/cyan]\n"
-            f"[bold]DNS Resolved:[/bold]      [cyan]{len(resolved)}[/cyan]\n"
-            f"[bold]Live Hosts:[/bold]         [cyan]{len(probed)}[/cyan]\n"
-            f"[bold]Scan Time:[/bold]          [cyan]{elapsed:.1f}s[/cyan]\n"
-            f"\n[bold]Output:[/bold]\n"
-            f"  [dim]TXT:[/dim]  {txt_path.resolve()}",
+            f"[bold]Unique Subdomains :[/bold]  [cyan]{len(all_subdomains)}[/cyan]\n"
+            f"[bold]DNS Resolved      :[/bold]  [cyan]{len(resolved)}[/cyan]\n"
+            f"[bold]Live Hosts        :[/bold]  [cyan]{len(probed)}[/cyan]\n"
+            f"[bold]Scan Time         :[/bold]  [cyan]{elapsed:.1f}s[/cyan]",
             title="[bold green]Scan Complete[/bold green]",
             border_style="green",
         ))
