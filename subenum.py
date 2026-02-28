@@ -1255,38 +1255,6 @@ async def run(args):
     txt_path = output_dir / "subdomains.txt"
     write_txt(all_subdomains, txt_path)
 
-    # JSON
-    json_data = {
-        "domain": domain,
-        "timestamp": get_timestamp(),
-        "elapsed_seconds": round(elapsed, 2),
-        "total_unique": len(all_subdomains),
-        "resolved_count": len(resolved),
-        "live_count": len(probed),
-        "sources": {k: list(v) for k, v in all_source_results.items()},
-        "all_subdomains": sorted(list(all_subdomains)),
-        "resolved": {k: v for k, v in resolved.items()},
-        "live_hosts": probed,
-    }
-    json_path = output_dir / "subdomains.json"
-    write_json(json_data, json_path)
-
-    # CSV
-    csv_path = output_dir / "subdomains.csv"
-    write_csv(all_subdomains, resolved, probed, csv_path)
-
-    # HTML Report
-    html_path = output_dir / "report.html"
-    generate_html_report(
-        domain=domain,
-        all_subdomains=all_subdomains,
-        source_results=all_source_results,
-        resolved=resolved,
-        probed=probed,
-        elapsed=elapsed,
-        filepath=html_path,
-    )
-
     # ── Phase 7: Terminal Summary ──
     if args.silent:
         # Silent mode: just print subdomains
@@ -1301,11 +1269,8 @@ async def run(args):
             f"[bold]DNS Resolved:[/bold]      [cyan]{len(resolved)}[/cyan]\n"
             f"[bold]Live Hosts:[/bold]         [cyan]{len(probed)}[/cyan]\n"
             f"[bold]Scan Time:[/bold]          [cyan]{elapsed:.1f}s[/cyan]\n"
-            f"\n[bold]Output Files:[/bold]\n"
-            f"  [dim]TXT:[/dim]  {txt_path.resolve()}\n"
-            f"  [dim]JSON:[/dim] {json_path.resolve()}\n"
-            f"  [dim]CSV:[/dim]  {csv_path.resolve()}\n"
-            f"  [dim]HTML:[/dim] {html_path.resolve()}",
+            f"\n[bold]Output:[/bold]\n"
+            f"  [dim]TXT:[/dim]  {txt_path.resolve()}",
             title="[bold green]Scan Complete[/bold green]",
             border_style="green",
         ))
