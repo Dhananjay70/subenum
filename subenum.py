@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import csv
 import json
+import sqlite3
 import logging
 import os
 import platform
@@ -101,7 +102,7 @@ BANNER = r"""[bold cyan]
   ███████  ██████  ██████  ██   ██ ███████  ██████  ██████  ██   ████
 [/bold cyan]
 [dim]  ──────────────────────────────────────────────────────────────────
-  Comprehensive Subdomain Enumeration Automation  │  v1.0
+  Comprehensive Subdomain Enumeration Automation  │  v2.0
   22+ Sources  │  CLI Tools + APIs + Curl Endpoints
   ──────────────────────────────────────────────────────────────────[/dim]
 """
@@ -111,6 +112,219 @@ SUBDOMAIN_REGEX = re.compile(
 )
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RETRY REQUEST HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def retry_request(
+    session: aiohttp.ClientSession,
+    url: str,
+    retries: int = 3,
+    backoff: float = 1.0,
+    **kwargs,
+) -> aiohttp.ClientResponse | None:
+    """GET request with exponential backoff on 429/5xx errors."""
+    for attempt in range(retries + 1):
+        try:
+            resp = await session.get(url, **kwargs)
+            if resp.status == 429 or resp.status >= 500:
+                if attempt < retries:
+                    wait = backoff * (2 ** attempt)
+                    log.debug(f"Retry {attempt+1}/{retries} for {url} (HTTP {resp.status}), waiting {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+            return resp
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt < retries:
+                wait = backoff * (2 ** attempt)
+                log.debug(f"Retry {attempt+1}/{retries} for {url} ({e}), waiting {wait}s")
+                await asyncio.sleep(wait)
+            else:
+                raise
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQLITE DATABASE STORAGE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SubReconDB:
+    """SQLite storage for scan history and diff tracking."""
+
+    def __init__(self, db_path: str = "results/subrecon.db"):
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self._init_tables()
+
+    def _init_tables(self):
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                domain TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                total_subdomains INTEGER DEFAULT 0,
+                resolved_count INTEGER DEFAULT 0,
+                live_count INTEGER DEFAULT 0,
+                elapsed REAL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS subdomains (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id INTEGER NOT NULL,
+                subdomain TEXT NOT NULL,
+                source TEXT DEFAULT '',
+                FOREIGN KEY (scan_id) REFERENCES scans(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_domain ON scans(domain);
+            CREATE INDEX IF NOT EXISTS idx_sub ON subdomains(subdomain);
+        """)
+        self.conn.commit()
+
+    def save_scan(
+        self,
+        domain: str,
+        subdomains: set[str],
+        source_results: dict[str, set[str]],
+        resolved_count: int,
+        live_count: int,
+        elapsed: float,
+    ) -> int:
+        """Save a scan and return the scan ID."""
+        cur = self.conn.execute(
+            "INSERT INTO scans (domain, timestamp, total_subdomains, resolved_count, live_count, elapsed) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (domain, datetime.now(timezone.utc).isoformat(), len(subdomains), resolved_count, live_count, elapsed),
+        )
+        scan_id = cur.lastrowid
+
+        # Build subdomain → sources mapping
+        sub_sources: dict[str, list[str]] = {}
+        for source, subs in source_results.items():
+            for s in subs:
+                sub_sources.setdefault(s, []).append(source)
+
+        rows = []
+        for sub in sorted(subdomains):
+            sources_str = ",".join(sub_sources.get(sub, ["unknown"]))
+            rows.append((scan_id, sub, sources_str))
+
+        self.conn.executemany(
+            "INSERT INTO subdomains (scan_id, subdomain, source) VALUES (?, ?, ?)",
+            rows,
+        )
+        self.conn.commit()
+        return scan_id
+
+    def get_previous_subdomains(self, domain: str) -> set[str]:
+        """Get all subdomains from the previous scan of this domain."""
+        row = self.conn.execute(
+            "SELECT id FROM scans WHERE domain = ? ORDER BY id DESC LIMIT 1 OFFSET 1",
+            (domain,),
+        ).fetchone()
+        if not row:
+            return set()
+        rows = self.conn.execute(
+            "SELECT subdomain FROM subdomains WHERE scan_id = ?",
+            (row[0],),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def get_new_subdomains(self, domain: str, current: set[str]) -> set[str]:
+        """Return subdomains that are new compared to the previous scan."""
+        previous = self.get_previous_subdomains(domain)
+        if not previous:
+            return current  # First scan = all are new
+        return current - previous
+
+    def close(self):
+        self.conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTIFICATION SUPPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Notifier:
+    """Send scan notifications to Discord, Slack, or Telegram."""
+
+    def __init__(
+        self,
+        discord_webhook: str = "",
+        slack_webhook: str = "",
+        telegram_token: str = "",
+        telegram_chat_id: str = "",
+    ):
+        self.discord_webhook = discord_webhook
+        self.slack_webhook = slack_webhook
+        self.telegram_token = telegram_token
+        self.telegram_chat_id = telegram_chat_id
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.discord_webhook or self.slack_webhook or (self.telegram_token and self.telegram_chat_id))
+
+    async def send(
+        self,
+        domain: str,
+        total: int,
+        resolved: int,
+        live: int,
+        new_count: int | None = None,
+        elapsed: float = 0,
+    ):
+        """Send scan summary to all configured channels."""
+        new_str = f"\n🆕 New subdomains: {new_count}" if new_count is not None else ""
+        summary = (
+            f"🔍 SubRecon Scan Complete\n"
+            f"🎯 Domain: {domain}\n"
+            f"📊 Subdomains: {total}\n"
+            f"🌐 DNS Resolved: {resolved}\n"
+            f"✅ Live Hosts: {live}{new_str}\n"
+            f"⏱️ Time: {elapsed:.1f}s"
+        )
+
+        tasks = []
+        if self.discord_webhook:
+            tasks.append(self._send_discord(summary))
+        if self.slack_webhook:
+            tasks.append(self._send_slack(summary))
+        if self.telegram_token and self.telegram_chat_id:
+            tasks.append(self._send_telegram(summary))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _send_discord(self, message: str):
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {"content": message}
+                async with session.post(self.discord_webhook, json=payload) as resp:
+                    if resp.status not in (200, 204):
+                        log.debug(f"Discord notification failed: HTTP {resp.status}")
+        except Exception as e:
+            log.debug(f"Discord notification error: {e}")
+
+    async def _send_slack(self, message: str):
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {"text": message}
+                async with session.post(self.slack_webhook, json=payload) as resp:
+                    if resp.status != 200:
+                        log.debug(f"Slack notification failed: HTTP {resp.status}")
+        except Exception as e:
+            log.debug(f"Slack notification error: {e}")
+
+    async def _send_telegram(self, message: str):
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+            async with aiohttp.ClientSession() as session:
+                payload = {"chat_id": self.telegram_chat_id, "text": message}
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        log.debug(f"Telegram notification failed: HTTP {resp.status}")
+        except Exception as e:
+            log.debug(f"Telegram notification error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,15 +589,15 @@ class APIFetcher:
         url = f"https://crt.sh/?q=%25.{self.domain}&output=json"
         subs = set()
         try:
-            async with session.get(url, ssl=False) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    for entry in data:
-                        name_value = entry.get("name_value", "")
-                        for name in name_value.split("\n"):
-                            cleaned = clean_subdomain(name)
-                            if is_valid_subdomain(cleaned, self.domain):
-                                subs.add(cleaned)
+            resp = await retry_request(session, url, ssl=False)
+            if resp and resp.status == 200:
+                data = await resp.json(content_type=None)
+                for entry in data:
+                    name_value = entry.get("name_value", "")
+                    for name in name_value.split("\n"):
+                        cleaned = clean_subdomain(name)
+                        if is_valid_subdomain(cleaned, self.domain):
+                            subs.add(cleaned)
         except Exception as e:
             log.warning(f"[error] crt.sh: {e}")
         self.results["crt.sh"] = subs
@@ -394,11 +608,11 @@ class APIFetcher:
         url = f"https://jldc.me/anubis/subdomains/{self.domain}"
         subs = set()
         try:
-            async with session.get(url, ssl=False) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, list):
-                        subs = self._extract(data)
+            resp = await retry_request(session, url, ssl=False)
+            if resp and resp.status == 200:
+                data = await resp.json(content_type=None)
+                if isinstance(data, list):
+                    subs = self._extract(data)
         except Exception as e:
             log.warning(f"[error] jldc: {e}")
         self.results["jldc"] = subs
@@ -407,26 +621,25 @@ class APIFetcher:
     async def fetch_alienvault(self, session: aiohttp.ClientSession) -> set[str]:
         """AlienVault OTX"""
         subs = set()
-        # Fetch multiple pages
         for page in range(1, 20):
             url = (f"https://otx.alienvault.com/api/v1/indicators/domain/"
                    f"{self.domain}/url_list?limit=500&page={page}")
             try:
-                async with session.get(url, ssl=False) as resp:
-                    if resp.status == 200:
-                        data = await resp.json(content_type=None)
-                        url_list = data.get("url_list", [])
-                        if not url_list:
-                            break
-                        for entry in url_list:
-                            hostname = entry.get("hostname") or ""
-                            if not hostname:
-                                continue
-                            cleaned = clean_subdomain(hostname)
-                            if is_valid_subdomain(cleaned, self.domain):
-                                subs.add(cleaned)
-                    else:
+                resp = await retry_request(session, url, ssl=False)
+                if resp and resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    url_list = data.get("url_list", [])
+                    if not url_list:
                         break
+                    for entry in url_list:
+                        hostname = entry.get("hostname") or ""
+                        if not hostname:
+                            continue
+                        cleaned = clean_subdomain(hostname)
+                        if is_valid_subdomain(cleaned, self.domain):
+                            subs.add(cleaned)
+                else:
+                    break
             except Exception as e:
                 log.warning(f"[error] alienvault page {page}: {e}")
                 break
@@ -438,11 +651,11 @@ class APIFetcher:
         url = f"https://api.subdomain.center/?domain={self.domain}"
         subs = set()
         try:
-            async with session.get(url, ssl=False) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, list):
-                        subs = self._extract(data)
+            resp = await retry_request(session, url, ssl=False)
+            if resp and resp.status == 200:
+                data = await resp.json(content_type=None)
+                if isinstance(data, list):
+                    subs = self._extract(data)
         except Exception as e:
             log.warning(f"[error] subdomain-center: {e}")
         self.results["subdomain-center"] = subs
@@ -454,15 +667,15 @@ class APIFetcher:
                f"domain={self.domain}&include_subdomains=true&expand=dns_names")
         subs = set()
         try:
-            async with session.get(url, ssl=False) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, list):
-                        for entry in data:
-                            for name in entry.get("dns_names", []):
-                                cleaned = clean_subdomain(name)
-                                if is_valid_subdomain(cleaned, self.domain):
-                                    subs.add(cleaned)
+            resp = await retry_request(session, url, ssl=False)
+            if resp and resp.status == 200:
+                data = await resp.json(content_type=None)
+                if isinstance(data, list):
+                    for entry in data:
+                        for name in entry.get("dns_names", []):
+                            cleaned = clean_subdomain(name)
+                            if is_valid_subdomain(cleaned, self.domain):
+                                subs.add(cleaned)
         except Exception as e:
             log.warning(f"[error] certspotter: {e}")
         self.results["certspotter"] = subs
@@ -479,14 +692,14 @@ class APIFetcher:
                f"apikey={self.vt_api_key}&domain={self.domain}")
         subs = set()
         try:
-            async with session.get(url, ssl=False) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    for entry in data.get("subdomains", []):
-                        full = f"{entry}.{self.domain}" if "." not in entry else entry
-                        cleaned = clean_subdomain(full)
-                        if is_valid_subdomain(cleaned, self.domain):
-                            subs.add(cleaned)
+            resp = await retry_request(session, url, ssl=False)
+            if resp and resp.status == 200:
+                data = await resp.json(content_type=None)
+                for entry in data.get("subdomains", []):
+                    full = f"{entry}.{self.domain}" if "." not in entry else entry
+                    cleaned = clean_subdomain(full)
+                    if is_valid_subdomain(cleaned, self.domain):
+                        subs.add(cleaned)
         except Exception as e:
             log.warning(f"[error] virustotal: {e}")
         self.results["virustotal"] = subs
@@ -497,16 +710,15 @@ class APIFetcher:
         url = f"https://tls.bufferover.run/dns?q=.{self.domain}"
         subs = set()
         try:
-            async with session.get(url, ssl=False) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    for line in data.get("Results", []):
-                        # Format: "ip,hostname" or just hostname
-                        parts = line.split(",")
-                        for part in parts:
-                            cleaned = clean_subdomain(part)
-                            if is_valid_subdomain(cleaned, self.domain):
-                                subs.add(cleaned)
+            resp = await retry_request(session, url, ssl=False)
+            if resp and resp.status == 200:
+                data = await resp.json(content_type=None)
+                for line in data.get("Results", []):
+                    parts = line.split(",")
+                    for part in parts:
+                        cleaned = clean_subdomain(part)
+                        if is_valid_subdomain(cleaned, self.domain):
+                            subs.add(cleaned)
         except Exception as e:
             log.warning(f"[error] bufferover: {e}")
         self.results["bufferover"] = subs
@@ -517,15 +729,15 @@ class APIFetcher:
         url = f"https://api.hackertarget.com/hostsearch/?q={self.domain}"
         subs = set()
         try:
-            async with session.get(url, ssl=False) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    if "error" not in text.lower():
-                        for line in text.splitlines():
-                            hostname = line.split(",")[0]
-                            cleaned = clean_subdomain(hostname)
-                            if is_valid_subdomain(cleaned, self.domain):
-                                subs.add(cleaned)
+            resp = await retry_request(session, url, ssl=False)
+            if resp and resp.status == 200:
+                text = await resp.text()
+                if "error" not in text.lower():
+                    for line in text.splitlines():
+                        hostname = line.split(",")[0]
+                        cleaned = clean_subdomain(hostname)
+                        if is_valid_subdomain(cleaned, self.domain):
+                            subs.add(cleaned)
         except Exception as e:
             log.warning(f"[error] hackertarget: {e}")
         self.results["hackertarget"] = subs
@@ -536,25 +748,24 @@ class APIFetcher:
         url = f"https://rapiddns.io/subdomain/{self.domain}?full=1"
         subs = set()
         try:
-            async with session.get(url, ssl=False) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    if BeautifulSoup:
-                        soup = BeautifulSoup(html, "html.parser")
-                        for td in soup.find_all("td"):
-                            text = td.get_text(strip=True)
-                            cleaned = clean_subdomain(text)
-                            if is_valid_subdomain(cleaned, self.domain):
-                                subs.add(cleaned)
-                    else:
-                        # Fallback: regex extraction
-                        pattern = re.compile(
-                            rf"[a-zA-Z0-9._-]+\.{re.escape(self.domain)}"
-                        )
-                        for match in pattern.findall(html):
-                            cleaned = clean_subdomain(match)
-                            if is_valid_subdomain(cleaned, self.domain):
-                                subs.add(cleaned)
+            resp = await retry_request(session, url, ssl=False)
+            if resp and resp.status == 200:
+                html = await resp.text()
+                if BeautifulSoup:
+                    soup = BeautifulSoup(html, "html.parser")
+                    for td in soup.find_all("td"):
+                        text = td.get_text(strip=True)
+                        cleaned = clean_subdomain(text)
+                        if is_valid_subdomain(cleaned, self.domain):
+                            subs.add(cleaned)
+                else:
+                    pattern = re.compile(
+                        rf"[a-zA-Z0-9._-]+\.{re.escape(self.domain)}"
+                    )
+                    for match in pattern.findall(html):
+                        cleaned = clean_subdomain(match)
+                        if is_valid_subdomain(cleaned, self.domain):
+                            subs.add(cleaned)
         except Exception as e:
             log.warning(f"[error] rapiddns: {e}")
         self.results["rapiddns"] = subs
@@ -565,15 +776,15 @@ class APIFetcher:
         url = f"https://urlscan.io/api/v1/search/?q=domain:{self.domain}&size=1000"
         subs = set()
         try:
-            async with session.get(url, ssl=False) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    for result in data.get("results", []):
-                        page = result.get("page", {})
-                        domain_val = page.get("domain", "")
-                        cleaned = clean_subdomain(domain_val)
-                        if is_valid_subdomain(cleaned, self.domain):
-                            subs.add(cleaned)
+            resp = await retry_request(session, url, ssl=False)
+            if resp and resp.status == 200:
+                data = await resp.json(content_type=None)
+                for result in data.get("results", []):
+                    page = result.get("page", {})
+                    domain_val = page.get("domain", "")
+                    cleaned = clean_subdomain(domain_val)
+                    if is_valid_subdomain(cleaned, self.domain):
+                        subs.add(cleaned)
         except Exception as e:
             log.warning(f"[error] urlscan: {e}")
         self.results["urlscan"] = subs
@@ -1298,14 +1509,39 @@ async def run(args):
         console.print()
         print_source_table(all_source_results, len(all_subdomains))
 
+        # ── Database Storage ──
+        new_count = None
+        if hasattr(args, '_db') and args._db:
+            db: SubReconDB = args._db
+            if args.diff:
+                new_count = len(db.get_new_subdomains(domain, all_subdomains))
+            db.save_scan(domain, all_subdomains, all_source_results,
+                         len(resolved), len(probed), elapsed)
+
+        diff_line = ""
+        if new_count is not None:
+            diff_line = f"\n[bold]New Subdomains    :[/bold]  [yellow]{new_count}[/yellow]"
+
         console.print(Panel(
             f"[bold]Unique Subdomains :[/bold]  [cyan]{len(all_subdomains)}[/cyan]\n"
             f"[bold]DNS Resolved      :[/bold]  [cyan]{len(resolved)}[/cyan]\n"
             f"[bold]Live Hosts        :[/bold]  [cyan]{len(probed)}[/cyan]\n"
-            f"[bold]Scan Time         :[/bold]  [cyan]{elapsed:.1f}s[/cyan]",
+            f"[bold]Scan Time         :[/bold]  [cyan]{elapsed:.1f}s[/cyan]"
+            f"{diff_line}",
             title="[bold green]Scan Complete[/bold green]",
             border_style="green",
         ))
+
+        # ── Notifications ──
+        if hasattr(args, '_notifier') and args._notifier and args._notifier.enabled:
+            await args._notifier.send(
+                domain=domain,
+                total=len(all_subdomains),
+                resolved=len(resolved),
+                live=len(probed),
+                new_count=new_count,
+                elapsed=elapsed,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1323,16 +1559,17 @@ def main():
         epilog="""
 Examples:
   python subenum.py example.com
-  python subenum.py example.com --no-probe --timeout 20
-  python subenum.py example.com --no-tools          # API sources only
-  python subenum.py example.com --silent             # Just print subdomains
+  python subenum.py --list domains.txt                # Multi-domain scan
+  python subenum.py example.com --diff                # Show only new subdomains
+  python subenum.py example.com --no-tools            # API sources only
+  python subenum.py example.com --silent              # Just print subdomains
   python subenum.py example.com -o ./output --threads 100
-  python subenum.py example.com --wordlist /path/to/wordlist.txt
-  python subenum.py example.com --vt-key YOUR_KEY --github-token YOUR_TOKEN
+  python subenum.py example.com --discord-webhook URL # Send Discord alert
         """
     )
 
-    parser.add_argument("domain", help="Target domain to enumerate")
+    parser.add_argument("domain", nargs="?", default=None, help="Target domain to enumerate")
+    parser.add_argument("--list", dest="domain_list", help="File with one domain per line for multi-domain scan")
     parser.add_argument("-o", "--output", help="Output directory (default: results/<domain>)")
     parser.add_argument("--threads", type=int, default=50, help="Concurrency level (default: 50)")
     parser.add_argument("--timeout", type=int, default=15, help="HTTP/API timeout in seconds (default: 15)")
@@ -1343,6 +1580,7 @@ Examples:
     parser.add_argument("--no-probe", action="store_true", help="Skip HTTP probing")
     parser.add_argument("--no-tools", action="store_true", help="Skip CLI tools, use API sources only")
     parser.add_argument("--silent", action="store_true", help="Minimal output, just print subdomains")
+    parser.add_argument("--diff", action="store_true", help="Show only NEW subdomains since last scan")
 
     # API Keys
     parser.add_argument("--vt-key", help="VirusTotal API key (or set VT_API_KEY env)")
@@ -1355,10 +1593,20 @@ Examples:
     parser.add_argument("--resolvers", help="Custom resolvers file path (auto-downloads Trickest if not set)")
     parser.add_argument("--subfinder-config", help="Path to subfinder provider-config.yaml")
 
+    # Notifications
+    parser.add_argument("--discord-webhook", help="Discord webhook URL for notifications")
+    parser.add_argument("--slack-webhook", help="Slack webhook URL for notifications")
+    parser.add_argument("--telegram-bot-token", help="Telegram bot token for notifications")
+    parser.add_argument("--telegram-chat-id", help="Telegram chat ID for notifications")
+
     # Verbosity
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose/debug logging")
 
     args = parser.parse_args()
+
+    # Validate: need either domain or --list
+    if not args.domain and not args.domain_list:
+        parser.error("Please provide a domain or use --list <file>")
 
     # Setup logging
     level = logging.DEBUG if args.verbose else logging.CRITICAL
@@ -1372,7 +1620,53 @@ Examples:
     if platform.system() == "Windows" and sys.version_info < (3, 14):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    asyncio.run(run(args))
+    # Initialize DB
+    db = SubReconDB()
+    args._db = db
+
+    # Initialize Notifier
+    notifier = Notifier(
+        discord_webhook=args.discord_webhook or os.environ.get("DISCORD_WEBHOOK", ""),
+        slack_webhook=args.slack_webhook or os.environ.get("SLACK_WEBHOOK", ""),
+        telegram_token=args.telegram_bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=args.telegram_chat_id or os.environ.get("TELEGRAM_CHAT_ID", ""),
+    )
+    args._notifier = notifier
+
+    # Build domain list
+    domains = []
+    if args.domain_list:
+        list_path = Path(args.domain_list)
+        if not list_path.exists():
+            console.print(f"[red][!] Domain list file not found: {args.domain_list}[/red]")
+            sys.exit(1)
+        with open(list_path, "r") as f:
+            for line in f:
+                d = line.strip().lower()
+                if d and not d.startswith("#"):
+                    domains.append(d)
+        if not domains:
+            console.print("[red][!] No domains found in the list file[/red]")
+            sys.exit(1)
+    else:
+        domains = [args.domain.strip().lower()]
+
+    # Run scans
+    if len(domains) == 1:
+        args.domain = domains[0]
+        asyncio.run(run(args))
+    else:
+        async def run_multi():
+            for i, domain in enumerate(domains, 1):
+                if not args.silent:
+                    console.print(f"\n[bold magenta]━━━ Scanning {i}/{len(domains)}: {domain} ━━━[/bold magenta]\n")
+                args.domain = domain
+                args.output = None  # Let each domain use its own default output dir
+                await run(args)
+        asyncio.run(run_multi())
+
+    # Cleanup
+    db.close()
 
 
 if __name__ == "__main__":
