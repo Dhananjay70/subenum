@@ -1159,108 +1159,142 @@ async def run(args):
 
     all_subdomains: set[str] = set()
     all_source_results: dict[str, set[str]] = {}
+    resolved: dict[str, list[str]] = {}
+    probed: list[dict] = []
 
-    # ── Phase 1: Download resolvers if needed ──
-    resolvers_file = args.resolvers
-    if not resolvers_file and args.wordlist:
-        if not args.silent:
-            console.print("\n[bold cyan][*][/bold cyan] Downloading fresh Trickest resolvers...")
-        resolvers_file = await download_trickest_resolvers(output_dir)
-
-    # ── Phase 2: Run API sources ──
-    if not args.silent:
-        console.print("\n[bold cyan][*][/bold cyan] Querying API sources (10 endpoints)...")
-
-    api_fetcher = APIFetcher(
-        domain=domain,
-        timeout=args.timeout,
-        vt_api_key=args.vt_key or os.environ.get("VT_API_KEY", ""),
-    )
-    api_results = await api_fetcher.fetch_all()
-    all_source_results.update(api_results)
-    for subs in api_results.values():
-        all_subdomains.update(subs)
-
-    if not args.silent:
-        api_total = sum(len(s) for s in api_results.values())
-        console.print(f"  [green]✓[/green] API sources found [bold]{api_total}[/bold] subdomains (before dedup)")
-
-    # ── Phase 3: Run CLI tools ──
+    # Count total phases
+    total_phases = 2  # API + Output always run
     if not args.no_tools:
-        if not args.silent:
-            console.print("\n[bold cyan][*][/bold cyan] Running CLI tools (12 tools)...")
+        total_phases += 1
+    if not args.no_resolve:
+        total_phases += 1
+    if not args.no_probe:
+        total_phases += 1
 
-        cli_runner = CLIToolRunner(
-            domain=domain,
-            output_dir=output_dir,
-            timeout=args.tool_timeout,
-            github_token=args.github_token or os.environ.get("GITHUB_TOKEN", ""),
-            gitlab_token=args.gitlab_token or os.environ.get("GITLAB_TOKEN", ""),
-            shodan_key=args.shodan_key or os.environ.get("SHODAN_KEY", ""),
-            wordlist=args.wordlist or os.environ.get("WORDLIST", ""),
-            resolvers_file=resolvers_file or "",
-            subfinder_config=args.subfinder_config or "",
-        )
-        cli_results = await cli_runner.run_all()
-        all_source_results.update(cli_results)
-        for subs in cli_results.values():
+    if args.silent:
+        # ── Silent mode: no UI, just run everything ──
+        resolvers_file = args.resolvers
+        if not resolvers_file and (args.wordlist or os.environ.get("WORDLIST", "")):
+            resolvers_file = await download_trickest_resolvers(output_dir)
+
+        api_fetcher = APIFetcher(domain=domain, timeout=args.timeout,
+                                  vt_api_key=args.vt_key or os.environ.get("VT_API_KEY", ""))
+        api_results = await api_fetcher.fetch_all()
+        all_source_results.update(api_results)
+        for subs in api_results.values():
             all_subdomains.update(subs)
 
-        if not args.silent:
-            cli_total = sum(len(s) for s in cli_results.values())
-            console.print(f"  [green]✓[/green] CLI tools found [bold]{cli_total}[/bold] subdomains (before dedup)")
+        if not args.no_tools:
+            cli_runner = CLIToolRunner(
+                domain=domain, output_dir=output_dir, timeout=args.tool_timeout,
+                github_token=args.github_token or os.environ.get("GITHUB_TOKEN", ""),
+                gitlab_token=args.gitlab_token or os.environ.get("GITLAB_TOKEN", ""),
+                shodan_key=args.shodan_key or os.environ.get("SHODAN_KEY", ""),
+                wordlist=args.wordlist or os.environ.get("WORDLIST", ""),
+                resolvers_file=resolvers_file or "",
+                subfinder_config=args.subfinder_config or "",
+            )
+            cli_results = await cli_runner.run_all()
+            all_source_results.update(cli_results)
+            for subs in cli_results.values():
+                all_subdomains.update(subs)
 
-    if not args.silent:
-        console.print(f"\n[bold green][+][/bold green] Total unique subdomains: [bold]{len(all_subdomains)}[/bold]")
+        if not args.no_resolve and all_subdomains:
+            resolver = DNSResolver(domain=domain, concurrency=args.threads, timeout=5.0)
+            resolved = await resolver.resolve_all(all_subdomains)
 
-    # ── Phase 4: DNS Resolution ──
-    resolved: dict[str, list[str]] = {}
-    if not args.no_resolve and all_subdomains:
-        if not args.silent:
-            console.print(f"\n[bold cyan][*][/bold cyan] Resolving DNS for {len(all_subdomains)} subdomains...")
+        if not args.no_probe and all_subdomains:
+            probe_targets = set(resolved.keys()) if resolved else all_subdomains
+            prober = HTTPProber(concurrency=args.threads, timeout=args.timeout)
+            probed = await prober.probe_all(probe_targets)
 
-        resolver = DNSResolver(
-            domain=domain,
-            concurrency=args.threads,
-            timeout=5.0,
-        )
-        resolved = await resolver.resolve_all(all_subdomains)
-
-        if resolver.is_wildcard and not args.silent:
-            console.print(f"  [yellow]⚠[/yellow]  Wildcard DNS detected – filtered wildcard IPs")
-
-        if not args.silent:
-            console.print(f"  [green]✓[/green] {len(resolved)}/{len(all_subdomains)} subdomains resolved")
-
-    # ── Phase 5: HTTP Probing ──
-    probed: list[dict] = []
-    if not args.no_probe and all_subdomains:
-        probe_targets = set(resolved.keys()) if resolved else all_subdomains
-        if not args.silent:
-            console.print(f"\n[bold cyan][*][/bold cyan] Probing {len(probe_targets)} subdomains for live hosts...")
-
-        prober = HTTPProber(concurrency=args.threads, timeout=args.timeout)
-        probed = await prober.probe_all(probe_targets)
-
-        if not args.silent:
-            console.print(f"  [green]✓[/green] {len(probed)} live hosts found")
-
-    # ── Phase 6: Output ──
-    elapsed = time.time() - start_time
-
-    if not args.silent:
-        console.print(f"\n[bold cyan][*][/bold cyan] Writing output files...")
-
-    # TXT
-    txt_path = output_dir / "subdomains.txt"
-    write_txt(all_subdomains, txt_path)
-
-    # ── Phase 7: Terminal Summary ──
-    if args.silent:
-        # Silent mode: just print subdomains
+        txt_path = output_dir / "subdomains.txt"
+        write_txt(all_subdomains, txt_path)
         for sub in sorted(all_subdomains):
             print(sub)
+
     else:
+        # ── Interactive mode: progress bar ──
+        resolvers_file = args.resolvers
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=30),
+            TextColumn("[bold]{task.completed}/{task.total}[/bold]"),
+            TextColumn("[dim]{task.fields[status]}[/dim]"),
+            console=console,
+            transient=False,
+        ) as progress:
+
+            scan_task = progress.add_task("Scanning", total=total_phases, status="Starting...")
+            phase = 0
+
+            # Phase: Download resolvers if needed
+            if not resolvers_file and (args.wordlist or os.environ.get("WORDLIST", "")):
+                progress.update(scan_task, status="Downloading resolvers...")
+                resolvers_file = await download_trickest_resolvers(output_dir)
+
+            # Phase: API Sources
+            progress.update(scan_task, completed=phase, status="Querying 10 API sources...")
+            api_fetcher = APIFetcher(domain=domain, timeout=args.timeout,
+                                      vt_api_key=args.vt_key or os.environ.get("VT_API_KEY", ""))
+            api_results = await api_fetcher.fetch_all()
+            all_source_results.update(api_results)
+            for subs in api_results.values():
+                all_subdomains.update(subs)
+            phase += 1
+            progress.update(scan_task, completed=phase,
+                            status=f"APIs done — {sum(len(s) for s in api_results.values())} found")
+
+            # Phase: CLI Tools
+            if not args.no_tools:
+                progress.update(scan_task, status="Running 12 CLI tools...")
+                cli_runner = CLIToolRunner(
+                    domain=domain, output_dir=output_dir, timeout=args.tool_timeout,
+                    github_token=args.github_token or os.environ.get("GITHUB_TOKEN", ""),
+                    gitlab_token=args.gitlab_token or os.environ.get("GITLAB_TOKEN", ""),
+                    shodan_key=args.shodan_key or os.environ.get("SHODAN_KEY", ""),
+                    wordlist=args.wordlist or os.environ.get("WORDLIST", ""),
+                    resolvers_file=resolvers_file or "",
+                    subfinder_config=args.subfinder_config or "",
+                )
+                cli_results = await cli_runner.run_all()
+                all_source_results.update(cli_results)
+                for subs in cli_results.values():
+                    all_subdomains.update(subs)
+                phase += 1
+                progress.update(scan_task, completed=phase,
+                                status=f"CLI done — {len(all_subdomains)} unique total")
+
+            # Phase: DNS Resolution
+            if not args.no_resolve and all_subdomains:
+                progress.update(scan_task, status=f"Resolving DNS for {len(all_subdomains)} subdomains...")
+                resolver = DNSResolver(domain=domain, concurrency=args.threads, timeout=5.0)
+                resolved = await resolver.resolve_all(all_subdomains)
+                phase += 1
+                progress.update(scan_task, completed=phase,
+                                status=f"DNS done — {len(resolved)}/{len(all_subdomains)} resolved")
+
+            # Phase: HTTP Probing
+            if not args.no_probe and all_subdomains:
+                probe_targets = set(resolved.keys()) if resolved else all_subdomains
+                progress.update(scan_task, status=f"Probing {len(probe_targets)} hosts...")
+                prober = HTTPProber(concurrency=args.threads, timeout=args.timeout)
+                probed = await prober.probe_all(probe_targets)
+                phase += 1
+                progress.update(scan_task, completed=phase,
+                                status=f"Probing done — {len(probed)} live hosts")
+
+            # Phase: Save output
+            progress.update(scan_task, status="Saving results...")
+            txt_path = output_dir / "subdomains.txt"
+            write_txt(all_subdomains, txt_path)
+            phase += 1
+            progress.update(scan_task, completed=phase, status="Complete ✓")
+
+        # ── Final Summary ──
+        elapsed = time.time() - start_time
         console.print()
         print_source_table(all_source_results, len(all_subdomains))
 
