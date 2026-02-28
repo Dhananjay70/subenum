@@ -1295,8 +1295,6 @@ async def run(args):
     else:
         console.print()
         print_source_table(all_source_results, len(all_subdomains))
-        console.print()
-        print_probe_table(probed)
 
         console.print(Panel(
             f"[bold]Unique Subdomains:[/bold] [cyan]{len(all_subdomains)}[/cyan]\n"
