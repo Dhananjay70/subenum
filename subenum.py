@@ -1197,7 +1197,7 @@ async def run(args):
             github_token=args.github_token or os.environ.get("GITHUB_TOKEN", ""),
             gitlab_token=args.gitlab_token or os.environ.get("GITLAB_TOKEN", ""),
             shodan_key=args.shodan_key or os.environ.get("SHODAN_KEY", ""),
-            wordlist=args.wordlist or "",
+            wordlist=args.wordlist or os.environ.get("WORDLIST", ""),
             resolvers_file=resolvers_file or "",
             subfinder_config=args.subfinder_config or "",
         )
@@ -1329,7 +1329,7 @@ Examples:
     args = parser.parse_args()
 
     # Setup logging
-    level = logging.DEBUG if args.verbose else logging.WARNING
+    level = logging.DEBUG if args.verbose else logging.CRITICAL
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",
