@@ -102,8 +102,8 @@ BANNER = r"""[bold cyan]
   ███████  ██████  ██████  ██   ██ ███████  ██████  ██████  ██   ████
 [/bold cyan]
 [dim]  ──────────────────────────────────────────────────────────────────
-  Comprehensive Subdomain Enumeration Automation  │  v2.0
-  22+ Sources  │  CLI Tools + APIs + Curl Endpoints
+  Comprehensive Subdomain Enumeration Automation  │  v3.0
+  25+ Sources  │  CLI Tools + APIs + Curl Endpoints
   ──────────────────────────────────────────────────────────────────[/dim]
 """
 
@@ -383,10 +383,12 @@ class CLIToolRunner:
         self.resolvers_file = resolvers_file
         self.subfinder_config = subfinder_config
         self.results: dict[str, set[str]] = {}
+        self.errors: dict[str, str] = {}  # source → error reason
 
     async def _run(self, name: str, cmd: list[str], parse_file: Optional[str] = None) -> set[str]:
         """Run a CLI tool and return discovered subdomains."""
         if not tool_exists(cmd[0]):
+            self.errors[name] = "not found on PATH"
             log.warning(f"[skip] {name} not found on PATH")
             return set()
 
@@ -420,8 +422,10 @@ class CLIToolRunner:
                             subs.add(cleaned)
 
         except asyncio.TimeoutError:
+            self.errors[name] = f"timeout ({self.timeout}s)"
             log.warning(f"[timeout] {name} exceeded {self.timeout}s")
         except Exception as e:
+            self.errors[name] = str(e)[:60]
             log.warning(f"[error] {name}: {e}")
 
         self.results[name] = subs
@@ -457,6 +461,7 @@ class CLIToolRunner:
     async def run_haktrails(self) -> set[str]:
         """echo domain | haktrails subdomains"""
         if not tool_exists("haktrails"):
+            self.errors["haktrails"] = "not found on PATH"
             log.warning("[skip] haktrails not found on PATH")
             return set()
 
@@ -474,6 +479,7 @@ class CLIToolRunner:
                     if is_valid_subdomain(cleaned, self.domain):
                         subs.add(cleaned)
         except Exception as e:
+            self.errors["haktrails"] = str(e)[:60]
             log.warning(f"[error] haktrails: {e}")
 
         self.results["haktrails"] = subs
@@ -482,6 +488,7 @@ class CLIToolRunner:
     async def run_gau(self) -> set[str]:
         """echo domain | gau → extract subdomains via regex"""
         if not tool_exists("gau"):
+            self.errors["gau"] = "not found on PATH"
             log.warning("[skip] gau not found on PATH")
             return set()
 
@@ -502,6 +509,7 @@ class CLIToolRunner:
                     if is_valid_subdomain(cleaned, self.domain):
                         subs.add(cleaned)
         except Exception as e:
+            self.errors["gau"] = str(e)[:60]
             log.warning(f"[error] gau: {e}")
 
         self.results["gau"] = subs
@@ -509,6 +517,7 @@ class CLIToolRunner:
 
     async def run_github_subdomains(self) -> set[str]:
         if not self.github_token:
+            self.errors["github-subdomains"] = "no GITHUB_TOKEN set"
             log.warning("[skip] github-subdomains: no GITHUB_TOKEN set")
             return set()
         cmd = ["github-subdomains", "-d", self.domain, "-t", self.github_token]
@@ -516,6 +525,7 @@ class CLIToolRunner:
 
     async def run_gitlab_subdomains(self) -> set[str]:
         if not self.gitlab_token:
+            self.errors["gitlab-subdomains"] = "no GITLAB_TOKEN set"
             log.warning("[skip] gitlab-subdomains: no GITLAB_TOKEN set")
             return set()
         cmd = ["gitlab-subdomains", "-d", self.domain, "-t", self.gitlab_token]
@@ -527,6 +537,7 @@ class CLIToolRunner:
 
     async def run_shosubgo(self) -> set[str]:
         if not self.shodan_key:
+            self.errors["shosubgo"] = "no SHODAN_KEY set"
             log.warning("[skip] shosubgo: no SHODAN_KEY set")
             return set()
         cmd = ["shosubgo", "-d", self.domain, "-s", self.shodan_key]
@@ -534,6 +545,7 @@ class CLIToolRunner:
 
     async def run_puredns(self) -> set[str]:
         if not self.wordlist or not os.path.isfile(self.wordlist):
+            self.errors["puredns"] = "no wordlist file provided"
             log.warning("[skip] puredns: no wordlist file provided")
             return set()
         cmd = ["puredns", "bruteforce", self.wordlist, self.domain, "-q"]
@@ -568,12 +580,14 @@ class CLIToolRunner:
 class APIFetcher:
     """Fetches subdomains from all API / curl-based sources."""
 
-    def __init__(self, domain: str, timeout: int = 15,
-                 vt_api_key: str = ""):
+    def __init__(self, domain: str, timeout: int = 30,
+                 vt_api_key: str = "", securitytrails_key: str = ""):
         self.domain = domain
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.vt_api_key = vt_api_key
+        self.securitytrails_key = securitytrails_key
         self.results: dict[str, set[str]] = {}
+        self.errors: dict[str, str] = {}  # source → error reason
         self.headers = {"User-Agent": USER_AGENT}
 
     def _extract(self, raw_list: list[str]) -> set[str]:
@@ -585,20 +599,32 @@ class APIFetcher:
         return subs
 
     async def fetch_crtsh(self, session: aiohttp.ClientSession) -> set[str]:
-        """Certificate Transparency via crt.sh"""
+        """Certificate Transparency via crt.sh (dedicated 30s timeout)"""
         url = f"https://crt.sh/?q=%25.{self.domain}&output=json"
         subs = set()
+        # crt.sh is slow but very valuable — use a dedicated 30s timeout
+        crtsh_timeout = aiohttp.ClientTimeout(total=30)
         try:
-            resp = await retry_request(session, url, ssl=False)
-            if resp and resp.status == 200:
-                data = await resp.json(content_type=None)
-                for entry in data:
-                    name_value = entry.get("name_value", "")
-                    for name in name_value.split("\n"):
-                        cleaned = clean_subdomain(name)
-                        if is_valid_subdomain(cleaned, self.domain):
-                            subs.add(cleaned)
+            async with aiohttp.ClientSession(
+                headers=self.headers, timeout=crtsh_timeout,
+                connector=aiohttp.TCPConnector(ssl=False)
+            ) as crt_session:
+                resp = await retry_request(crt_session, url, ssl=False)
+                if resp and resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    for entry in data:
+                        name_value = entry.get("name_value", "")
+                        for name in name_value.split("\n"):
+                            cleaned = clean_subdomain(name)
+                            if is_valid_subdomain(cleaned, self.domain):
+                                subs.add(cleaned)
+                elif resp:
+                    self.errors["crt.sh"] = f"HTTP {resp.status}"
+        except asyncio.TimeoutError:
+            self.errors["crt.sh"] = "timeout (30s)"
+            log.warning("[error] crt.sh: timeout after 30s")
         except Exception as e:
+            self.errors["crt.sh"] = str(e)[:60]
             log.warning(f"[error] crt.sh: {e}")
         self.results["crt.sh"] = subs
         return subs
@@ -614,6 +640,7 @@ class APIFetcher:
                 if isinstance(data, list):
                     subs = self._extract(data)
         except Exception as e:
+            self.errors["jldc"] = str(e)[:60]
             log.warning(f"[error] jldc: {e}")
         self.results["jldc"] = subs
         return subs
@@ -641,6 +668,7 @@ class APIFetcher:
                 else:
                     break
             except Exception as e:
+                self.errors["alienvault"] = str(e)[:60]
                 log.warning(f"[error] alienvault page {page}: {e}")
                 break
         self.results["alienvault"] = subs
@@ -657,6 +685,7 @@ class APIFetcher:
                 if isinstance(data, list):
                     subs = self._extract(data)
         except Exception as e:
+            self.errors["subdomain-center"] = str(e)[:60]
             log.warning(f"[error] subdomain-center: {e}")
         self.results["subdomain-center"] = subs
         return subs
@@ -677,6 +706,7 @@ class APIFetcher:
                             if is_valid_subdomain(cleaned, self.domain):
                                 subs.add(cleaned)
         except Exception as e:
+            self.errors["certspotter"] = str(e)[:60]
             log.warning(f"[error] certspotter: {e}")
         self.results["certspotter"] = subs
         return subs
@@ -684,6 +714,7 @@ class APIFetcher:
     async def fetch_virustotal(self, session: aiohttp.ClientSession) -> set[str]:
         """VirusTotal API (requires API key)"""
         if not self.vt_api_key:
+            self.errors["virustotal"] = "no VT_API_KEY set"
             log.warning("[skip] virustotal: no VT_API_KEY set")
             self.results["virustotal"] = set()
             return set()
@@ -701,27 +732,35 @@ class APIFetcher:
                     if is_valid_subdomain(cleaned, self.domain):
                         subs.add(cleaned)
         except Exception as e:
+            self.errors["virustotal"] = str(e)[:60]
             log.warning(f"[error] virustotal: {e}")
         self.results["virustotal"] = subs
         return subs
 
-    async def fetch_bufferover(self, session: aiohttp.ClientSession) -> set[str]:
-        """BufferOver TLS"""
-        url = f"https://tls.bufferover.run/dns?q=.{self.domain}"
+    async def fetch_wayback(self, session: aiohttp.ClientSession) -> set[str]:
+        """Wayback Machine CDX API — massive historical dataset, no key needed"""
+        url = (f"https://web.archive.org/cdx/search/cdx?"
+               f"url=*.{self.domain}&output=json&fl=original&collapse=urlkey&limit=10000")
         subs = set()
         try:
             resp = await retry_request(session, url, ssl=False)
             if resp and resp.status == 200:
                 data = await resp.json(content_type=None)
-                for line in data.get("Results", []):
-                    parts = line.split(",")
-                    for part in parts:
-                        cleaned = clean_subdomain(part)
+                # First row is the header ["original"], skip it
+                for row in data[1:] if len(data) > 1 else []:
+                    if row:
+                        raw_url = row[0] if isinstance(row, list) else row
+                        # Extract hostname from URL
+                        hostname = re.sub(r"^https?://", "", str(raw_url)).split("/")[0].split(":")[0]
+                        cleaned = clean_subdomain(hostname)
                         if is_valid_subdomain(cleaned, self.domain):
                             subs.add(cleaned)
+            elif resp:
+                self.errors["wayback"] = f"HTTP {resp.status}"
         except Exception as e:
-            log.warning(f"[error] bufferover: {e}")
-        self.results["bufferover"] = subs
+            self.errors["wayback"] = str(e)[:60]
+            log.warning(f"[error] wayback: {e}")
+        self.results["wayback"] = subs
         return subs
 
     async def fetch_hackertarget(self, session: aiohttp.ClientSession) -> set[str]:
@@ -739,6 +778,7 @@ class APIFetcher:
                         if is_valid_subdomain(cleaned, self.domain):
                             subs.add(cleaned)
         except Exception as e:
+            self.errors["hackertarget"] = str(e)[:60]
             log.warning(f"[error] hackertarget: {e}")
         self.results["hackertarget"] = subs
         return subs
@@ -767,6 +807,7 @@ class APIFetcher:
                         if is_valid_subdomain(cleaned, self.domain):
                             subs.add(cleaned)
         except Exception as e:
+            self.errors["rapiddns"] = str(e)[:60]
             log.warning(f"[error] rapiddns: {e}")
         self.results["rapiddns"] = subs
         return subs
@@ -785,9 +826,90 @@ class APIFetcher:
                     cleaned = clean_subdomain(domain_val)
                     if is_valid_subdomain(cleaned, self.domain):
                         subs.add(cleaned)
+            elif resp:
+                self.errors["urlscan"] = f"HTTP {resp.status}"
         except Exception as e:
+            self.errors["urlscan"] = str(e)[:60]
             log.warning(f"[error] urlscan: {e}")
         self.results["urlscan"] = subs
+        return subs
+
+    async def fetch_commoncrawl(self, session: aiohttp.ClientSession) -> set[str]:
+        """CommonCrawl Index API — complements Wayback with different crawl data"""
+        subs = set()
+        # Try the latest index
+        index_url = "https://index.commoncrawl.org/collinfo.json"
+        try:
+            resp = await retry_request(session, index_url, ssl=False)
+            if not resp or resp.status != 200:
+                self.errors["commoncrawl"] = "could not fetch index list"
+                self.results["commoncrawl"] = subs
+                return subs
+
+            indexes = await resp.json(content_type=None)
+            if not indexes:
+                self.errors["commoncrawl"] = "empty index list"
+                self.results["commoncrawl"] = subs
+                return subs
+
+            # Use the latest index
+            latest_api = indexes[0].get("cdx-api", "")
+            if not latest_api:
+                self.errors["commoncrawl"] = "no CDX API in latest index"
+                self.results["commoncrawl"] = subs
+                return subs
+
+            search_url = f"{latest_api}?url=*.{self.domain}&output=json&limit=5000"
+            resp2 = await retry_request(session, search_url, ssl=False)
+            if resp2 and resp2.status == 200:
+                text = await resp2.text()
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        raw_url = entry.get("url", "")
+                        hostname = re.sub(r"^https?://", "", raw_url).split("/")[0].split(":")[0]
+                        cleaned = clean_subdomain(hostname)
+                        if is_valid_subdomain(cleaned, self.domain):
+                            subs.add(cleaned)
+                    except json.JSONDecodeError:
+                        continue
+            elif resp2:
+                self.errors["commoncrawl"] = f"HTTP {resp2.status}"
+        except Exception as e:
+            self.errors["commoncrawl"] = str(e)[:60]
+            log.warning(f"[error] commoncrawl: {e}")
+        self.results["commoncrawl"] = subs
+        return subs
+
+    async def fetch_securitytrails(self, session: aiohttp.ClientSession) -> set[str]:
+        """SecurityTrails API — direct API call, no CLI needed"""
+        if not self.securitytrails_key:
+            self.errors["securitytrails"] = "no SECURITYTRAILS_KEY set"
+            log.warning("[skip] securitytrails: no SECURITYTRAILS_KEY set")
+            self.results["securitytrails"] = set()
+            return set()
+
+        url = f"https://api.securitytrails.com/v1/domain/{self.domain}/subdomains"
+        subs = set()
+        try:
+            headers = {"APIKEY": self.securitytrails_key}
+            resp = await retry_request(session, url, ssl=False, headers=headers)
+            if resp and resp.status == 200:
+                data = await resp.json(content_type=None)
+                for sub_name in data.get("subdomains", []):
+                    full = f"{sub_name}.{self.domain}"
+                    cleaned = clean_subdomain(full)
+                    if is_valid_subdomain(cleaned, self.domain):
+                        subs.add(cleaned)
+            elif resp:
+                self.errors["securitytrails"] = f"HTTP {resp.status}"
+        except Exception as e:
+            self.errors["securitytrails"] = str(e)[:60]
+            log.warning(f"[error] securitytrails: {e}")
+        self.results["securitytrails"] = subs
         return subs
 
     async def fetch_all(self) -> dict[str, set[str]]:
@@ -803,10 +925,12 @@ class APIFetcher:
                 self.fetch_subdomain_center(session),
                 self.fetch_certspotter(session),
                 self.fetch_virustotal(session),
-                self.fetch_bufferover(session),
+                self.fetch_wayback(session),
                 self.fetch_hackertarget(session),
                 self.fetch_rapiddns(session),
                 self.fetch_urlscan(session),
+                self.fetch_commoncrawl(session),
+                self.fetch_securitytrails(session),
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
         return self.results
@@ -1369,8 +1493,10 @@ function filterSubs() {{
 # TERMINAL UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def print_source_table(source_results: dict[str, set[str]], total: int):
+def print_source_table(source_results: dict[str, set[str]], total: int,
+                       errors: dict[str, str] | None = None):
     """Print a rich table showing results per source."""
+    errors = errors or {}
     table = Table(
         title="[bold cyan]Source Results[/bold cyan]",
         box=box.ROUNDED,
@@ -1381,17 +1507,25 @@ def print_source_table(source_results: dict[str, set[str]], total: int):
     table.add_column("Source", style="cyan", min_width=20)
     table.add_column("Found", justify="right", style="bold white", min_width=8)
     table.add_column("Status", min_width=10)
+    table.add_column("Reason", style="dim", min_width=20)
 
     for name, subs in sorted(source_results.items(), key=lambda x: -len(x[1])):
         count = len(subs)
         if count > 0:
             status = f"[green]✓ {count}[/green]"
+            reason = ""
         else:
-            status = "[dim red]✗ 0[/dim red]"
-        table.add_row(name, str(count), status)
+            err = errors.get(name, "")
+            if err:
+                status = "[yellow]⚠ 0[/yellow]"
+                reason = f"[dim yellow]{err}[/dim yellow]"
+            else:
+                status = "[dim red]✗ 0[/dim red]"
+                reason = ""
+        table.add_row(name, str(count), status, reason)
 
     table.add_section()
-    table.add_row("[bold]TOTAL (deduplicated)[/bold]", f"[bold green]{total}[/bold green]", "")
+    table.add_row("[bold]TOTAL (deduplicated)[/bold]", f"[bold green]{total}[/bold green]", "", "")
     console.print(table)
 
 
@@ -1473,9 +1607,11 @@ async def run(args):
             resolvers_file = await download_trickest_resolvers(output_dir)
 
         api_fetcher = APIFetcher(domain=domain, timeout=args.timeout,
-                                  vt_api_key=args.vt_key or os.environ.get("VT_API_KEY", ""))
+                                  vt_api_key=args.vt_key or os.environ.get("VT_API_KEY", ""),
+                                  securitytrails_key=args.securitytrails_key or os.environ.get("SECURITYTRAILS_KEY", ""))
         api_results = await api_fetcher.fetch_all()
         all_source_results.update(api_results)
+        all_errors = dict(api_fetcher.errors)
         for subs in api_results.values():
             all_subdomains.update(subs)
 
@@ -1491,6 +1627,7 @@ async def run(args):
             )
             cli_results = await cli_runner.run_all()
             all_source_results.update(cli_results)
+            all_errors.update(cli_runner.errors)
             for subs in cli_results.values():
                 all_subdomains.update(subs)
 
@@ -1531,10 +1668,12 @@ async def run(args):
                 resolvers_file = await download_trickest_resolvers(output_dir)
 
             # Phase: API Sources
-            progress.update(scan_task, completed=phase, status="Querying 10 API sources...")
+            progress.update(scan_task, completed=phase, status="Querying 12 API sources...")
             api_fetcher = APIFetcher(domain=domain, timeout=args.timeout,
-                                      vt_api_key=args.vt_key or os.environ.get("VT_API_KEY", ""))
+                                      vt_api_key=args.vt_key or os.environ.get("VT_API_KEY", ""),
+                                      securitytrails_key=args.securitytrails_key or os.environ.get("SECURITYTRAILS_KEY", ""))
             api_results = await api_fetcher.fetch_all()
+            all_errors = dict(api_fetcher.errors)
             all_source_results.update(api_results)
             for subs in api_results.values():
                 all_subdomains.update(subs)
@@ -1556,6 +1695,7 @@ async def run(args):
                 )
                 cli_results = await cli_runner.run_all()
                 all_source_results.update(cli_results)
+                all_errors.update(cli_runner.errors)
                 for subs in cli_results.values():
                     all_subdomains.update(subs)
                 phase += 1
@@ -1591,7 +1731,7 @@ async def run(args):
         # ── Final Summary ──
         elapsed = time.time() - start_time
         console.print()
-        print_source_table(all_source_results, len(all_subdomains))
+        print_source_table(all_source_results, len(all_subdomains), all_errors)
 
         # ── Database Storage ──
         new_count = None
@@ -1656,7 +1796,7 @@ Examples:
     parser.add_argument("--list", dest="domain_list", help="File with one domain per line for multi-domain scan")
     parser.add_argument("-o", "--output", help="Output directory (default: results/<domain>)")
     parser.add_argument("--threads", type=int, default=50, help="Concurrency level (default: 50)")
-    parser.add_argument("--timeout", type=int, default=15, help="HTTP/API timeout in seconds (default: 15)")
+    parser.add_argument("--timeout", type=int, default=30, help="HTTP/API timeout in seconds (default: 30)")
     parser.add_argument("--tool-timeout", type=int, default=300, help="CLI tool timeout in seconds (default: 300)")
 
     # Feature flags
@@ -1671,6 +1811,7 @@ Examples:
     parser.add_argument("--github-token", help="GitHub token for github-subdomains (or set GITHUB_TOKEN env)")
     parser.add_argument("--gitlab-token", help="GitLab token for gitlab-subdomains (or set GITLAB_TOKEN env)")
     parser.add_argument("--shodan-key", help="Shodan API key for shosubgo (or set SHODAN_KEY env)")
+    parser.add_argument("--securitytrails-key", help="SecurityTrails API key (or set SECURITYTRAILS_KEY env)")
 
     # Tool configs
     parser.add_argument("--wordlist", help="Wordlist path for puredns bruteforce")
