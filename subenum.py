@@ -883,14 +883,97 @@ class DNSResolver:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HTTPProber:
-    """Probe subdomains for live HTTP(S) responses."""
+    """Probe subdomains for live HTTP(S) responses using projectdiscovery/httpx."""
 
     def __init__(self, concurrency: int = 50, timeout: int = 10):
         self.concurrency = concurrency
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.timeout = timeout
 
-    async def probe_one(self, session: aiohttp.ClientSession, subdomain: str) -> Optional[dict]:
-        """Probe a single subdomain on HTTP and HTTPS."""
+    async def probe_all(self, subdomains: set[str]) -> list[dict]:
+        """Probe all subdomains using the httpx CLI tool."""
+        if not subdomains:
+            return []
+
+        if not tool_exists("httpx"):
+            log.warning("[!] httpx not found on PATH – falling back to aiohttp prober")
+            return await self._fallback_probe(subdomains)
+
+        # Write targets to a temp file for httpx to consume
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        )
+        try:
+            for sub in sorted(subdomains):
+                tmp.write(sub + "\n")
+            tmp.close()
+
+            cmd = [
+                "httpx",
+                "-l", tmp.name,
+                "-json",
+                "-title",
+                "-server",
+                "-status-code",
+                "-content-length",
+                "-follow-redirects",
+                "-threads", str(self.concurrency),
+                "-timeout", str(self.timeout),
+                "-silent",
+            ]
+
+            log.info(f"[*] Running httpx on {len(subdomains)} targets ...")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+
+            if stderr:
+                err_text = stderr.decode(errors="ignore").strip()
+                if err_text:
+                    log.debug(f"[httpx stderr] {err_text[:500]}")
+
+            results: list[dict] = []
+            for line in stdout.decode(errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                url = entry.get("url", "")
+                scheme = "https" if url.startswith("https") else "http"
+
+                results.append({
+                    "subdomain": entry.get("input", entry.get("host", "")),
+                    "url": url,
+                    "status": entry.get("status_code", entry.get("status-code", 0)),
+                    "title": (entry.get("title", "") or "")[:100],
+                    "server": entry.get("webserver", entry.get("server", "")),
+                    "content_length": str(entry.get("content_length", entry.get("content-length", ""))),
+                    "scheme": scheme,
+                })
+
+            results.sort(key=lambda x: (x["status"], x["subdomain"]))
+            log.info(f"[+] httpx found {len(results)} live hosts")
+            return results
+
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    # ── Fallback: aiohttp-based prober (used when httpx is not installed) ──
+
+    async def _fallback_probe_one(
+        self, session: aiohttp.ClientSession, subdomain: str
+    ) -> Optional[dict]:
+        """Probe a single subdomain on HTTP and HTTPS (fallback)."""
         for scheme in ("https", "http"):
             url = f"{scheme}://{subdomain}"
             try:
@@ -911,19 +994,20 @@ class HTTPProber:
                 continue
         return None
 
-    async def probe_all(self, subdomains: set[str]) -> list[dict]:
-        """Probe all subdomains concurrently."""
+    async def _fallback_probe(self, subdomains: set[str]) -> list[dict]:
+        """Probe all subdomains using aiohttp (fallback when httpx is absent)."""
         sem = asyncio.Semaphore(self.concurrency)
-        results = []
+        results: list[dict] = []
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
 
         connector = aiohttp.TCPConnector(limit=self.concurrency, ssl=False)
         async with aiohttp.ClientSession(
-            timeout=self.timeout, connector=connector,
+            timeout=timeout, connector=connector,
             headers={"User-Agent": USER_AGENT}
         ) as session:
             async def _probe(sub):
                 async with sem:
-                    result = await self.probe_one(session, sub)
+                    result = await self._fallback_probe_one(session, sub)
                     if result:
                         results.append(result)
 
